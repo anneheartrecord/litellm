@@ -238,6 +238,10 @@ class MCPClient:
         self.ssl_verify: Optional[VerifyTypes] = ssl_verify
         self._aws_auth: Optional[httpx.Auth] = aws_auth
         self._last_initialize_instructions: Optional[str] = None
+        # ServerCapabilities advertised by the most recent initialize handshake
+        # (None when unknown). Used to skip resources/prompts probes the server
+        # never declared, per the MCP capability-negotiation spec.
+        self._last_server_capabilities: Optional[Any] = None
         self._sampling_callback: Optional[Callable] = sampling_callback
         self._elicitation_callback: Optional[Callable] = elicitation_callback
         self._logging_callback: Optional[Callable] = logging_callback
@@ -372,10 +376,14 @@ class MCPClient:
             try:
                 init_result = await session.initialize()
                 self._last_initialize_instructions = None
+                self._last_server_capabilities = None
                 if init_result is not None:
                     ins = getattr(init_result, "instructions", None)
                     if isinstance(ins, str) and ins.strip():
                         self._last_initialize_instructions = ins.strip()
+                    self._last_server_capabilities = getattr(
+                        init_result, "capabilities", None
+                    )
                 return await operation(session)
             finally:
                 try:
@@ -405,6 +413,7 @@ class MCPClient:
         http_client: Optional[httpx.AsyncClient] = None
         try:
             self._last_initialize_instructions = None
+            self._last_server_capabilities = None
             transport_ctx, http_client = self._create_transport_context()
             return await self._execute_session_operation(transport_ctx, operation)
         except Exception:
@@ -418,6 +427,30 @@ class MCPClient:
                     await http_client.aclose()
                 except BaseException as e:
                     verbose_logger.debug(f"Error during http_client cleanup: {e}")
+
+    def _server_advertises_capability(self, capability_name: str) -> bool:
+        """Whether the connected MCP server advertised the given capability.
+
+        Per the MCP spec a server only implements the ``resources/*`` and
+        ``prompts/*`` methods it declares in the ``capabilities`` block of its
+        initialize result. Probing a method the server did not advertise makes the
+        server answer with a JSON-RPC ``-32601 "Method not found"`` error, which
+        otherwise surfaces as a noisy ERROR log on every server that exposes only
+        tools (see issue #31179).
+
+        Args:
+            capability_name: ``ServerCapabilities`` field to look up, e.g.
+                ``"resources"`` or ``"prompts"``.
+
+        Returns:
+            True when the capability was advertised, or when capabilities are
+            unknown (``None`` — e.g. the server returned no capabilities block),
+            so the previous always-probe behavior is preserved in that case.
+        """
+        capabilities = self._last_server_capabilities
+        if capabilities is None:
+            return True
+        return getattr(capabilities, capability_name, None) is not None
 
     def update_auth_value(self, mcp_auth_value: Union[str, Dict[str, str]]):
         """
@@ -628,10 +661,18 @@ class MCPClient:
         )
 
         async def _list_prompts_operation(session: ClientSession):
+            if not self._server_advertises_capability("prompts"):
+                return None
             return await session.list_prompts()
 
         try:
             result = await self.run_with_session(_list_prompts_operation)
+            if result is None:
+                verbose_logger.debug(
+                    f"MCP server {self.server_url or 'stdio'} does not advertise the "
+                    f"'prompts' capability; skipping list_prompts"
+                )
+                return []
             prompt_count = len(result.prompts)
             prompt_names = [prompt.name for prompt in result.prompts]
             verbose_logger.info(
@@ -713,10 +754,18 @@ class MCPClient:
         )
 
         async def _list_resources_operation(session: ClientSession):
+            if not self._server_advertises_capability("resources"):
+                return None
             return await session.list_resources()
 
         try:
             result = await self.run_with_session(_list_resources_operation)
+            if result is None:
+                verbose_logger.debug(
+                    f"MCP server {self.server_url or 'stdio'} does not advertise the "
+                    f"'resources' capability; skipping list_resources"
+                )
+                return []
             resource_count = len(result.resources)
             resource_names = [resource.name for resource in result.resources]
             verbose_logger.info(
@@ -751,10 +800,19 @@ class MCPClient:
         )
 
         async def _list_resource_templates_operation(session: ClientSession):
+            # Resource templates live under the same "resources" capability.
+            if not self._server_advertises_capability("resources"):
+                return None
             return await session.list_resource_templates()
 
         try:
             result = await self.run_with_session(_list_resource_templates_operation)
+            if result is None:
+                verbose_logger.debug(
+                    f"MCP server {self.server_url or 'stdio'} does not advertise the "
+                    f"'resources' capability; skipping list_resource_templates"
+                )
+                return []
             resource_template_count = len(result.resourceTemplates)
             resource_template_names = [
                 resourceTemplate.name for resourceTemplate in result.resourceTemplates

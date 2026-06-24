@@ -2,6 +2,7 @@ import asyncio
 import os
 import ssl
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -423,6 +424,144 @@ class TestMCPClientInstructionsCapture:
 
         await client._execute_session_operation(transport_ctx, _op)
         assert client._last_initialize_instructions is None
+
+
+# ---------------------------------------------------------------------------
+# Server capability negotiation (skip resources/prompts probes the server
+# never advertised, instead of calling them and logging the resulting
+# JSON-RPC -32601 "Method not found" at ERROR level). Regression for #31179.
+# ---------------------------------------------------------------------------
+
+
+class TestMCPClientCapabilityNegotiation:
+    """Capability-aware list_resources / list_prompts probing."""
+
+    @staticmethod
+    def _build_session(mock_session_cls, init_result):
+        """Wire a mocked ClientSession that returns ``init_result`` on initialize."""
+        mock_session = AsyncMock()
+        mock_session.initialize = AsyncMock(return_value=init_result)
+
+        session_ctx = MagicMock()
+        session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        session_ctx.__aexit__ = AsyncMock(return_value=False)
+        mock_session_cls.return_value = session_ctx
+        return mock_session
+
+    @staticmethod
+    def _transport_ctx():
+        transport_ctx = MagicMock()
+        transport_ctx.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock()))
+        transport_ctx.__aexit__ = AsyncMock(return_value=False)
+        return transport_ctx
+
+    def test_initial_capabilities_is_none(self):
+        client = MCPClient(server_url="http://example.com/mcp", transport_type="http")
+        assert client._last_server_capabilities is None
+
+    def test_advertises_capability_defaults_true_when_unknown(self):
+        """No capabilities captured (older server) -> preserve always-probe behavior."""
+        client = MCPClient(server_url="http://example.com/mcp", transport_type="http")
+        assert client._server_advertises_capability("resources") is True
+        assert client._server_advertises_capability("prompts") is True
+
+    def test_advertises_capability_reflects_declared_fields(self):
+        client = MCPClient(server_url="http://example.com/mcp", transport_type="http")
+        client._last_server_capabilities = SimpleNamespace(
+            resources=SimpleNamespace(), prompts=None
+        )
+        assert client._server_advertises_capability("resources") is True
+        assert client._server_advertises_capability("prompts") is False
+
+    @pytest.mark.asyncio
+    @patch("litellm.experimental_mcp_client.client.ClientSession")
+    async def test_captures_capabilities_from_initialize(self, mock_session_cls):
+        client = MCPClient(server_url="http://example.com/mcp", transport_type="http")
+        init_result = MagicMock()
+        init_result.instructions = None
+        caps = SimpleNamespace(resources=SimpleNamespace(), prompts=None)
+        init_result.capabilities = caps
+        self._build_session(mock_session_cls, init_result)
+
+        async def _op(session):
+            return "done"
+
+        await client._execute_session_operation(self._transport_ctx(), _op)
+        assert client._last_server_capabilities is caps
+
+    @pytest.mark.asyncio
+    @patch("litellm.experimental_mcp_client.client.ClientSession")
+    async def test_list_resources_skipped_when_capability_absent(
+        self, mock_session_cls
+    ):
+        """Server without the resources capability -> [] and no probe call/ERROR."""
+        client = MCPClient(server_url="http://example.com/mcp", transport_type="http")
+        init_result = MagicMock()
+        init_result.instructions = None
+        init_result.capabilities = SimpleNamespace(
+            resources=None, prompts=SimpleNamespace(), tools=SimpleNamespace()
+        )
+        mock_session = self._build_session(mock_session_cls, init_result)
+        mock_session.list_resources = AsyncMock()
+
+        with patch.object(
+            client,
+            "_create_transport_context",
+            return_value=(self._transport_ctx(), None),
+        ):
+            result = await client.list_resources()
+
+        assert result == []
+        mock_session.list_resources.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("litellm.experimental_mcp_client.client.ClientSession")
+    async def test_list_prompts_skipped_when_capability_absent(self, mock_session_cls):
+        client = MCPClient(server_url="http://example.com/mcp", transport_type="http")
+        init_result = MagicMock()
+        init_result.instructions = None
+        init_result.capabilities = SimpleNamespace(
+            resources=SimpleNamespace(), prompts=None, tools=SimpleNamespace()
+        )
+        mock_session = self._build_session(mock_session_cls, init_result)
+        mock_session.list_prompts = AsyncMock()
+
+        with patch.object(
+            client,
+            "_create_transport_context",
+            return_value=(self._transport_ctx(), None),
+        ):
+            result = await client.list_prompts()
+
+        assert result == []
+        mock_session.list_prompts.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("litellm.experimental_mcp_client.client.ClientSession")
+    async def test_list_resources_called_when_capability_present(
+        self, mock_session_cls
+    ):
+        """Server that advertises resources -> the probe runs as before."""
+        client = MCPClient(server_url="http://example.com/mcp", transport_type="http")
+        init_result = MagicMock()
+        init_result.instructions = None
+        init_result.capabilities = SimpleNamespace(
+            resources=SimpleNamespace(), prompts=SimpleNamespace()
+        )
+        mock_session = self._build_session(mock_session_cls, init_result)
+        mock_session.list_resources = AsyncMock(
+            return_value=SimpleNamespace(resources=[])
+        )
+
+        with patch.object(
+            client,
+            "_create_transport_context",
+            return_value=(self._transport_ctx(), None),
+        ):
+            result = await client.list_resources()
+
+        assert result == []
+        mock_session.list_resources.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
